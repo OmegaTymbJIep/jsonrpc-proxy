@@ -1,4 +1,10 @@
-FROM golang:1.23-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+
+# Add support for cross-compilation
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 
@@ -11,8 +17,8 @@ RUN if [ -f go.sum ]; then go mod download; else go mod tidy; fi
 # Copy source code
 COPY *.go ./
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o jsonrpc-proxy
+# Build the application with proper cross-compilation flags
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o jsonrpc-proxy
 
 # Use a smaller image for the final build
 FROM alpine:3.17

@@ -1,0 +1,8 @@
+default_url: "https://mainnet.infura.io/v3/your-project-id"
+
+# Method-specific routing
+routes:
+  - method: "eth_chainId"
+    url: "https://polygon-rpc.com"
+  - method: "eth_blockNumber"
+    url: "https://rpc.ankr.com/eth"

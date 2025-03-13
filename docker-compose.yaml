@@ -1,0 +1,18 @@
+version: '3'
+
+services:
+  jsonrpc-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jsonrpc-proxy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config/config.yaml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

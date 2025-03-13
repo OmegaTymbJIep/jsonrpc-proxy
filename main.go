@@ -61,13 +61,15 @@ import (
 type Route struct {
 	Method string `yaml:"method"` // The JSON-RPC method name (e.g., "eth_chainId")
 	URL    string `yaml:"url"`    // The destination URL for this method
+	Name   string `yaml:"name"`   // A human-readable name for this URL (for logging)
 }
 
 // Config holds the complete proxy configuration loaded from the YAML file.
 // It contains the default fallback URL and a list of method-specific routes.
 type Config struct {
-	DefaultURL string  `yaml:"default_url"` // URL for methods without specific routes
-	Routes     []Route `yaml:"routes"`      // List of method-specific routes
+	DefaultURL  string  `yaml:"default_url"`  // URL for methods without specific routes
+	DefaultName string  `yaml:"default_name"` // A human-readable name for the default URL (for logging)
+	Routes      []Route `yaml:"routes"`       // List of method-specific routes
 }
 
 // JSONRPCRequest represents the structure of a JSON-RPC 2.0 request.
@@ -80,8 +82,9 @@ type JSONRPCRequest struct {
 }
 
 // Global variables
-var config Config                 // Holds the loaded configuration
-var methodToURL map[string]string // Maps method names to destination URLs
+var config Config                  // Holds the loaded configuration
+var methodToURL map[string]string  // Maps method names to destination URLs
+var methodToName map[string]string // Maps method names to URL display names
 
 // main is the entry point of the application.
 // It loads the configuration, sets up the HTTP server, and starts listening for requests.
@@ -117,8 +120,14 @@ func main() {
 	http.HandleFunc("/", handleProxy)
 	http.HandleFunc("/health", handleHealth)
 	serverAddr := fmt.Sprintf(":%d", *port)
-	log.Printf("Starting ANUS proxy server on %s", serverAddr)
-	log.Printf("Default URL: %s", config.DefaultURL)
+	log.Printf("Starting JSON-RPC HTTP proxy server on %s", serverAddr)
+
+	defaultDisplayName := config.DefaultName
+	if defaultDisplayName == "" {
+		defaultDisplayName = config.DefaultURL
+	}
+	log.Printf("Default URL: %s", defaultDisplayName)
+
 	log.Printf("Loaded %d method-specific routes", len(config.Routes))
 
 	if err := http.ListenAndServe(serverAddr, nil); err != nil {
@@ -150,15 +159,30 @@ func loadConfig(filename string) error {
 		return fmt.Errorf("default_url is required in configuration")
 	}
 
+	// If default_name isn't provided, set a generic name
+	if config.DefaultName == "" {
+		config.DefaultName = "default"
+	}
+
 	return nil
 }
 
 // buildMethodURLMap creates a lookup map from method names to their destination URLs.
 // This improves performance by allowing O(1) lookups instead of iterating through routes.
+// It also builds a map of method names to human-readable URL names for logging.
 func buildMethodURLMap() {
 	methodToURL = make(map[string]string)
+	methodToName = make(map[string]string)
+
 	for _, route := range config.Routes {
 		methodToURL[route.Method] = route.URL
+
+		// Use the provided name or the URL if name is empty
+		displayName := route.Name
+		if displayName == "" {
+			displayName = route.URL
+		}
+		methodToName[route.Method] = displayName
 	}
 }
 
@@ -228,7 +252,16 @@ func handleSingleRequest(w http.ResponseWriter, body []byte) {
 		targetURL = config.DefaultURL
 	}
 
-	log.Printf("Proxying method '%s' to %s", rpcRequest.Method, targetURL)
+	// Get display name for logging
+	displayName := config.DefaultName
+	if dn, exists := methodToName[rpcRequest.Method]; exists {
+		displayName = dn
+	}
+	if displayName == "" {
+		displayName = "default"
+	}
+
+	log.Printf("Proxying method '%s' to %s", rpcRequest.Method, displayName)
 
 	// Forward the request to the target URL
 	resp, err := forwardRequest(targetURL, body)
@@ -272,6 +305,7 @@ func handleBatchRequest(w http.ResponseWriter, body []byte) {
 	// Group requests by target URL for efficiency
 	requestsByURL := make(map[string][]json.RawMessage)
 	methodByID := make(map[interface{}]string) // To log methods by ID
+	nameByURL := make(map[string]string)       // For logging URL names
 
 	// First pass: unmarshall to get method and ID for grouping
 	for _, req := range batchRequests {
@@ -280,6 +314,16 @@ func handleBatchRequest(w http.ResponseWriter, body []byte) {
 		if !exists {
 			targetURL = config.DefaultURL
 		}
+
+		// Get display name for logging
+		displayName := config.DefaultName
+		if dn, exists := methodToName[req.Method]; exists {
+			displayName = dn
+		}
+		if displayName == "" {
+			displayName = "default"
+		}
+		nameByURL[targetURL] = displayName
 
 		// Convert the request back to raw JSON
 		rawRequest, err := json.Marshal(req)
@@ -293,7 +337,7 @@ func handleBatchRequest(w http.ResponseWriter, body []byte) {
 		// Store method by ID for logging
 		methodByID[req.ID] = req.Method
 
-		log.Printf("Batch request: method '%s' (ID: %v) to %s", req.Method, req.ID, targetURL)
+		log.Printf("Batch request: method '%s' (ID: %v) to %s", req.Method, req.ID, displayName)
 	}
 
 	// Process each group of requests to their target URL
@@ -317,7 +361,7 @@ func handleBatchRequest(w http.ResponseWriter, body []byte) {
 		// Convert each json.RawMessage to []byte for joining
 		byteBatch := make([][]byte, len(rawBatch))
 		for i, raw := range rawBatch {
-			byteBatch[i] = raw
+			byteBatch[i] = []byte(raw)
 		}
 
 		// Create a proper JSON array for the batch
@@ -326,7 +370,7 @@ func handleBatchRequest(w http.ResponseWriter, body []byte) {
 		// Forward this batch to the target URL
 		resp, err := forwardRequest(targetURL, batchBody)
 		if err != nil {
-			log.Printf("Error forwarding batch to %s: %v", targetURL, err)
+			log.Printf("Error forwarding batch to %s: %v", nameByURL[targetURL], err)
 			continue
 		}
 

@@ -5,6 +5,7 @@ A simple, configurable HTTP proxy for JSON-RPC requests written in Go. The proxy
 ## Features
 
 - Route JSON-RPC requests to different backends based on method name
+- Intelligent routing of batch requests to appropriate backends
 - YAML-based configuration
 - Fallback to default URL for undefined methods
 - Transparent proxy that preserves headers and status codes

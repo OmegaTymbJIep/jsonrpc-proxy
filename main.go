@@ -117,7 +117,7 @@ func main() {
 	http.HandleFunc("/", handleProxy)
 	http.HandleFunc("/health", handleHealth)
 	serverAddr := fmt.Sprintf(":%d", *port)
-	log.Printf("Starting JSON-RPC proxy server on %s", serverAddr)
+	log.Printf("Starting ANUS proxy server on %s", serverAddr)
 	log.Printf("Default URL: %s", config.DefaultURL)
 	log.Printf("Loaded %d method-specific routes", len(config.Routes))
 
@@ -165,6 +165,7 @@ func buildMethodURLMap() {
 // handleProxy processes incoming HTTP requests, extracts the JSON-RPC method,
 // determines the appropriate destination URL, and forwards the request.
 // It then relays the response back to the original client.
+// Supports both single requests and batch requests (arrays of requests).
 //
 // Parameters:
 //   - w: The HTTP response writer
@@ -184,6 +185,36 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	// Determine if this is a batch request (array) or single request
+	isBatchRequest := false
+	var rawMessage json.RawMessage
+	if err := json.Unmarshal(body, &rawMessage); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Check if the body starts with '[' to identify a batch request
+	trimmed := bytes.TrimSpace(rawMessage)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		isBatchRequest = true
+	}
+
+	if isBatchRequest {
+		// Handle batch request
+		handleBatchRequest(w, body)
+	} else {
+		// Handle single request
+		handleSingleRequest(w, body)
+	}
+}
+
+// handleSingleRequest processes a single JSON-RPC request.
+// It extracts the method, determines the target URL, and forwards the request.
+//
+// Parameters:
+//   - w: The HTTP response writer
+//   - body: The raw request body bytes
+func handleSingleRequest(w http.ResponseWriter, body []byte) {
 	// Parse the JSON-RPC request
 	var rpcRequest JSONRPCRequest
 	if err := json.Unmarshal(body, &rpcRequest); err != nil {
@@ -221,6 +252,119 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("Error copying response: %v", err)
 	}
+}
+
+// handleBatchRequest processes a batch of JSON-RPC requests.
+// It parses each request in the batch, routes them to appropriate targets,
+// and combines the responses.
+//
+// Parameters:
+//   - w: The HTTP response writer
+//   - body: The raw request body bytes containing an array of requests
+func handleBatchRequest(w http.ResponseWriter, body []byte) {
+	// Parse the batch of requests
+	var batchRequests []JSONRPCRequest
+	if err := json.Unmarshal(body, &batchRequests); err != nil {
+		http.Error(w, "Invalid JSON-RPC batch request", http.StatusBadRequest)
+		return
+	}
+
+	// Group requests by target URL for efficiency
+	requestsByURL := make(map[string][]json.RawMessage)
+	methodByID := make(map[interface{}]string) // To log methods by ID
+
+	// First pass: unmarshall to get method and ID for grouping
+	for _, req := range batchRequests {
+		// Determine target URL based on the method
+		targetURL, exists := methodToURL[req.Method]
+		if !exists {
+			targetURL = config.DefaultURL
+		}
+
+		// Convert the request back to raw JSON
+		rawRequest, err := json.Marshal(req)
+		if err != nil {
+			log.Printf("Error marshaling request: %v", err)
+			continue
+		}
+
+		requestsByURL[targetURL] = append(requestsByURL[targetURL], rawRequest)
+
+		// Store method by ID for logging
+		methodByID[req.ID] = req.Method
+
+		log.Printf("Batch request: method '%s' (ID: %v) to %s", req.Method, req.ID, targetURL)
+	}
+
+	// Process each group of requests to their target URL
+	allResponses := make([]json.RawMessage, 0)
+
+	for targetURL, requests := range requestsByURL {
+		// Create a JSON array for this batch of requests
+		batchJSON, err := json.Marshal(requests)
+		if err != nil {
+			log.Printf("Error creating batch request: %v", err)
+			continue
+		}
+
+		// Unwrap the batch to get array of raw requests
+		var rawBatch []json.RawMessage
+		if err := json.Unmarshal(batchJSON, &rawBatch); err != nil {
+			log.Printf("Error unwrapping batch: %v", err)
+			continue
+		}
+
+		// Convert each json.RawMessage to []byte for joining
+		byteBatch := make([][]byte, len(rawBatch))
+		for i, raw := range rawBatch {
+			byteBatch[i] = raw
+		}
+
+		// Create a proper JSON array for the batch
+		batchBody := []byte("[" + string(bytes.Join(byteBatch, []byte(","))) + "]")
+
+		// Forward this batch to the target URL
+		resp, err := forwardRequest(targetURL, batchBody)
+		if err != nil {
+			log.Printf("Error forwarding batch to %s: %v", targetURL, err)
+			continue
+		}
+
+		// Read the response body
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Error reading response: %v", err)
+			continue
+		}
+
+		// Parse the response to get the array of results
+		var responses []json.RawMessage
+		if err := json.Unmarshal(respBody, &responses); err != nil {
+			log.Printf("Error parsing batch response: %v", err)
+			continue
+		}
+
+		// Add these responses to the combined result
+		allResponses = append(allResponses, responses...)
+	}
+
+	// Send the combined batch response
+	w.Header().Set("Content-Type", "application/json")
+	if len(allResponses) == 0 {
+		// If no responses (all failed), return an empty array
+		w.Write([]byte("[]"))
+		return
+	}
+
+	// Marshal the final combined response
+	responseBody, err := json.Marshal(allResponses)
+	if err != nil {
+		http.Error(w, "Error creating response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(responseBody)
 }
 
 // handleHealth responds to health check requests with a 200 OK status.

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -229,6 +230,137 @@ func TestHandleProxy(t *testing.T) {
 				t.Errorf("Expected result %s, got %s", tc.expectedResult, result.Result)
 			}
 		})
+	}
+}
+
+// TestHandleBatchRequest tests the batch request handling functionality
+func TestHandleBatchRequest(t *testing.T) {
+	// Setup mock servers with batch response capabilities
+	batchServer1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var requests []JSONRPCRequest
+		if err := json.Unmarshal(body, &requests); err != nil {
+			t.Fatalf("Failed to parse batch request: %v", err)
+		}
+
+		responses := make([]map[string]interface{}, len(requests))
+		for i, req := range requests {
+			responses[i] = map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  fmt.Sprintf("response-server1-%v", req.ID),
+			}
+		}
+
+		respBytes, _ := json.Marshal(responses)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(respBytes)
+	}))
+	defer batchServer1.Close()
+
+	batchServer2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var requests []JSONRPCRequest
+		if err := json.Unmarshal(body, &requests); err != nil {
+			t.Fatalf("Failed to parse batch request: %v", err)
+		}
+
+		responses := make([]map[string]interface{}, len(requests))
+		for i, req := range requests {
+			responses[i] = map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  fmt.Sprintf("response-server2-%v", req.ID),
+			}
+		}
+
+		respBytes, _ := json.Marshal(responses)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(respBytes)
+	}))
+	defer batchServer2.Close()
+
+	// Setup configuration
+	config = Config{
+		DefaultURL: batchServer1.URL, // Default server
+		Routes: []Route{
+			{Method: "method1", URL: batchServer1.URL},
+			{Method: "method2", URL: batchServer2.URL},
+		},
+	}
+	buildMethodURLMap()
+
+	// Create a batch request with methods going to different servers
+	batchReq := []JSONRPCRequest{
+		{
+			JSONRPC: "2.0",
+			Method:  "method1",
+			Params:  []interface{}{},
+			ID:      1,
+		},
+		{
+			JSONRPC: "2.0",
+			Method:  "method2",
+			Params:  []interface{}{},
+			ID:      2,
+		},
+		{
+			JSONRPC: "2.0",
+			Method:  "unknown",
+			Params:  []interface{}{},
+			ID:      3,
+		},
+	}
+
+	reqBytes, _ := json.Marshal(batchReq)
+	req := httptest.NewRequest("POST", "/", bytes.NewReader(reqBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	// Test
+	handleProxy(w, req)
+
+	// Verify
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status code %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var results []map[string]interface{}
+	if err := json.Unmarshal(body, &results); err != nil {
+		t.Fatalf("Failed to parse batch response: %v\nResponse body: %s", err, string(body))
+	}
+
+	// We should have 3 responses
+	if len(results) != 3 {
+		t.Errorf("Expected 3 responses in batch, got %d", len(results))
+	}
+
+	// Verify response content (order might not be preserved, so check by ID)
+	expectedResults := map[float64]string{
+		1: "response-server1-1",
+		2: "response-server2-2",
+		3: "response-server1-3", // Unknown methods go to the default server
+	}
+
+	for _, res := range results {
+		id, ok := res["id"].(float64)
+		if !ok {
+			t.Errorf("Expected numeric ID, got %T: %v", res["id"], res["id"])
+			continue
+		}
+
+		expected, exists := expectedResults[id]
+		if !exists {
+			t.Errorf("Unexpected response ID: %v", id)
+			continue
+		}
+
+		if res["result"] != expected {
+			t.Errorf("For ID %v: expected result %s, got %s", id, expected, res["result"])
+		}
 	}
 }
 
